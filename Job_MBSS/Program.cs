@@ -15,14 +15,8 @@ namespace Job_MBSS
 
         static void Main(string[] args)
         {
-            try
-            {
-                Run().GetAwaiter().GetResult();
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("FATAL: " + ex);
-            }
+            try { Run().GetAwaiter().GetResult(); }
+            catch (Exception ex) { Console.WriteLine("FATAL: " + ex); }
         }
 
         static async System.Threading.Tasks.Task Run()
@@ -32,6 +26,7 @@ namespace Job_MBSS
             var uploadSvc = new UploadService();
             var pathRepo = new PathRepository();
             var logRepo = new LogRepository();
+            var fileRepo = new BoxFileRepository();
 
             var accessToken = await oauth.GetOrRefreshAccessToken();
             if (string.IsNullOrEmpty(accessToken))
@@ -45,7 +40,7 @@ namespace Job_MBSS
 
             foreach (var p in paths)
             {
-                Console.WriteLine("Scan folder: " + p.SourcePath);
+                Console.WriteLine("Scan: " + p.SourcePath);
 
                 if (!Directory.Exists(p.SourcePath))
                 {
@@ -53,18 +48,68 @@ namespace Job_MBSS
                     continue;
                 }
 
-                var files = Directory.GetFiles(p.SourcePath);
-                foreach (var f in files)
+                // queue only if changed
+                foreach (var f in Directory.GetFiles(p.SourcePath))
                 {
-                    logRepo.InsertPendingIfNeeded(f, p.TargetFolderId);
+                    var mtime = File.GetLastWriteTimeUtc(f);
+                    logRepo.QueueIfChanged(f, p.TargetFolderId, mtime);
                 }
 
+                // load pending and upload
                 var pending = logRepo.LoadPending(p.TargetFolderId);
 
                 foreach (var item in pending)
                 {
-                    var res = await uploadSvc.UploadFile(accessToken, item.FullPath, item.BoxFolderId);
-                    logRepo.UpdateStatus(item.Id, res.Status, res.Message);
+                    var localModUtc = item.LocalModifiedAt ?? File.GetLastWriteTimeUtc(item.FullPath);
+                    var existing = fileRepo.GetByFullPath(item.FullPath);
+
+                    UploadResult res;
+                    if (existing == null)
+                    {
+                        // first time upload
+                        res = await uploadSvc.UploadNew(accessToken, item.FullPath, item.BoxFolderId);
+                    }
+                    else
+                    {
+                        // only version if truly newer
+                        if (localModUtc <= existing.LocalModifiedAt)
+                        {
+                            res = new UploadResult
+                            {
+                                Success = true,
+                                Status = "SkipNotModified",
+                                Message = "Local file not newer than BoxFiles.LocalModifiedAt.",
+                                BoxFileId = existing.BoxFileId,
+                                LocalModifiedAt = localModUtc
+                            };
+                        }
+                        else
+                        {
+                            res = await uploadSvc.UploadNewVersion(accessToken, item.FullPath, existing.BoxFileId, existing.ETag);
+                        }
+                    }
+                    var folderRepo = new FolderRepository();
+                    // Upsert BoxFiles if we know file id (Success/Exists/Versioned)
+                    if (res.Success && !string.IsNullOrEmpty(res.BoxFileId))
+                    {
+                        // Pastikan folder ada di BoxFolders
+                        folderRepo.Upsert(item.BoxFolderId, Path.GetFileName(p.SourcePath));
+
+                        // Baru upsert file
+                        fileRepo.UpsertAfterUpload(
+                            item.FullPath,
+                            item.BoxFolderId,
+                            Path.GetFileName(item.FullPath),
+                            res.BoxFileId,
+                            res.LocalModifiedAt ?? File.GetLastWriteTimeUtc(item.FullPath),
+                            res.ETag,
+                            res.Sha1,
+                            res.VersionNumber
+                        );
+                    }
+
+                    // log status
+                    logRepo.UpdateStatus(item.Id, res.Status, res.Message, res.BoxFileId, res.LocalModifiedAt);
                     Console.WriteLine($"{item.FileName} → {res.Status}");
                 }
             }

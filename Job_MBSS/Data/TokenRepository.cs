@@ -1,5 +1,4 @@
 ﻿using System.Data.SqlClient;
-using Job_MBSS.Security;
 using Job_MBSS.Models;
 
 namespace Job_MBSS.Data
@@ -12,26 +11,27 @@ namespace Job_MBSS.Data
             {
                 if (rd.Read())
                 {
-                    var accessEnc = rd.IsDBNull(0) ? null : rd.GetString(0);
-                    var refreshEnc = rd.IsDBNull(1) ? null : rd.GetString(1);
+                    var pair = new TokenPair
+                    {
+                        AccessToken = rd.IsDBNull(0) ? null : rd.GetString(0),
+                        RefreshToken = rd.IsDBNull(1) ? null : rd.GetString(1)
+                    };
 
-                    var pair = new TokenPair();
-                    pair.AccessToken = string.IsNullOrEmpty(accessEnc) ? null : TokenCrypto.UnprotectToString(accessEnc);
-                    pair.RefreshToken = string.IsNullOrEmpty(refreshEnc) ? null : TokenCrypto.UnprotectToString(refreshEnc);
                     return pair;
                 }
             }
+
             return new TokenPair();
         }
 
         public void SaveTokens(TokenPair pair)
         {
-            var accessEnc = string.IsNullOrEmpty(pair.AccessToken) ? null : TokenCrypto.ProtectToBase64(pair.AccessToken);
-            var refreshEnc = string.IsNullOrEmpty(pair.RefreshToken) ? null : TokenCrypto.ProtectToBase64(pair.RefreshToken);
-
-            SqlHelper.ExecuteNonQuery("dbo.sp_Tokens_Save",
-                new SqlParameter("@AccessTokenEnc", (object)accessEnc ?? (object)System.DBNull.Value),
-                new SqlParameter("@RefreshTokenEnc", (object)refreshEnc ?? (object)System.DBNull.Value)
+            SqlHelper.ExecuteNonQuery(
+                "dbo.sp_Tokens_Save",
+                new SqlParameter("@AccessToken",
+                    (object)pair.AccessToken ?? (object)System.DBNull.Value),
+                new SqlParameter("@RefreshToken",
+                    (object)pair.RefreshToken ?? (object)System.DBNull.Value)
             );
         }
     }

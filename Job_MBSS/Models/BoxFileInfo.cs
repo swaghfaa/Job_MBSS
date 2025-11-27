@@ -6,13 +6,16 @@ using System.Threading.Tasks;
 
 namespace Job_MBSS.Models
 {
-    public class UploadItem
+    public class BoxFileInfo
     {
         public int Id;
-        public string FullPath;
+        public string BoxFileId;
         public string BoxFolderId;
         public string FileName;
-        public System.DateTime? LocalModifiedAt; // from log
-        public string BoxFileId;                 // from log if any
+        public string FullPath;
+        public System.DateTime LocalModifiedAt;
+        public string ETag;
+        public string Sha1;
+        public int? VersionNumber;
     }
 }
