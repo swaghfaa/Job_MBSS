@@ -1,0 +1,161 @@
+-- Folders dari Box (opsional tapi berguna buat referensi)
+IF OBJECT_ID('dbo.BoxFolders','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.BoxFolders(
+    BoxFolderId   VARCHAR(100) NOT NULL PRIMARY KEY,
+    Name          NVARCHAR(255) NULL,
+    CreatedAt     DATETIME NOT NULL DEFAULT(GETDATE())
+  );
+END
+GO
+
+-- Files map ke file Box + metadata versi terakhir yang kita tahu
+IF OBJECT_ID('dbo.BoxFiles','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.BoxFiles(
+    Id              INT IDENTITY PRIMARY KEY,
+    BoxFileId       VARCHAR(100) NOT NULL UNIQUE,
+    BoxFolderId     VARCHAR(100) NOT NULL,
+    FileName        NVARCHAR(255) NOT NULL,
+    FullPath        VARCHAR(500) NOT NULL UNIQUE,
+    LocalModifiedAt DATETIME NOT NULL,
+    ETag            VARCHAR(100) NULL,
+    Sha1            VARCHAR(64) NULL,
+    VersionNumber   INT NULL,
+    CreatedAt       DATETIME NOT NULL DEFAULT(GETDATE()),
+    UpdatedAt       DATETIME NOT NULL DEFAULT(GETDATE()),
+    CONSTRAINT FK_BoxFiles_Folder FOREIGN KEY (BoxFolderId) REFERENCES dbo.BoxFolders(BoxFolderId)
+  );
+
+  CREATE INDEX IX_BoxFiles_FullPath ON dbo.BoxFiles(FullPath);
+  CREATE INDEX IX_BoxFiles_BoxFolderId ON dbo.BoxFiles(BoxFolderId);
+END
+GO
+
+-- Tambahkan kolom ke log lama
+IF COL_LENGTH('dbo.BoxUploadLogs','BoxFileId') IS NULL
+  ALTER TABLE dbo.BoxUploadLogs ADD BoxFileId VARCHAR(100) NULL;
+IF COL_LENGTH('dbo.BoxUploadLogs','LocalModifiedAt') IS NULL
+  ALTER TABLE dbo.BoxUploadLogs ADD LocalModifiedAt DATETIME NULL;
+GO
+
+
+
+
+-- Upsert folder Box (opsional, kalau mau simpan nama folder)
+CREATE OR ALTER PROC dbo.sp_Folder_Upsert
+  @BoxFolderId VARCHAR(100),
+  @Name        NVARCHAR(255) = NULL
+AS
+BEGIN
+  SET NOCOUNT ON;
+  IF EXISTS(SELECT 1 FROM dbo.BoxFolders WHERE BoxFolderId=@BoxFolderId)
+    UPDATE dbo.BoxFolders SET Name=ISNULL(@Name,Name) WHERE BoxFolderId=@BoxFolderId;
+  ELSE
+    INSERT INTO dbo.BoxFolders(BoxFolderId,Name) VALUES(@BoxFolderId,@Name);
+END
+GO
+
+-- Ambil file Box berdasarkan full path lokal
+CREATE OR ALTER PROC dbo.sp_File_GetByFullPath
+  @FullPath VARCHAR(500)
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SELECT TOP(1)
+    Id, BoxFileId, BoxFolderId, FileName, FullPath, LocalModifiedAt, ETag, Sha1, VersionNumber
+  FROM dbo.BoxFiles
+  WHERE FullPath=@FullPath;
+END
+GO
+
+-- Setelah upload (baru atau versi), simpan/updated metadata
+CREATE OR ALTER PROC dbo.sp_File_UpsertAfterUpload
+  @FullPath        VARCHAR(500),
+  @BoxFolderId     VARCHAR(100),
+  @FileName        NVARCHAR(255),
+  @BoxFileId       VARCHAR(100),
+  @LocalModifiedAt DATETIME,
+  @ETag            VARCHAR(100) = NULL,
+  @Sha1            VARCHAR(64) = NULL,
+  @VersionNumber   INT = NULL
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  IF EXISTS(SELECT 1 FROM dbo.BoxFiles WHERE FullPath=@FullPath)
+  BEGIN
+    UPDATE dbo.BoxFiles
+      SET BoxFolderId     = @BoxFolderId,
+          FileName        = @FileName,
+          BoxFileId       = @BoxFileId,
+          LocalModifiedAt = @LocalModifiedAt,
+          ETag            = @ETag,
+          Sha1            = @Sha1,
+          VersionNumber   = @VersionNumber,
+          UpdatedAt       = GETDATE()
+    WHERE FullPath=@FullPath;
+  END
+  ELSE
+  BEGIN
+    INSERT INTO dbo.BoxFiles(BoxFileId,BoxFolderId,FileName,FullPath,LocalModifiedAt,ETag,Sha1,VersionNumber)
+    VALUES (@BoxFileId,@BoxFolderId,@FileName,@FullPath,@LocalModifiedAt,@ETag,@Sha1,@VersionNumber);
+  END
+END
+GO
+
+-- Queue log hanya jika file baru ATAU file berubah (modified)
+CREATE OR ALTER PROC dbo.sp_Log_QueueIfChanged
+  @FullPath        VARCHAR(500),
+  @BoxFolderId     VARCHAR(100),
+  @LocalModifiedAt DATETIME
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  DECLARE @KnownModified DATETIME = (
+    SELECT LocalModifiedAt FROM dbo.BoxFiles WHERE FullPath=@FullPath
+  );
+
+  IF @KnownModified IS NULL OR @LocalModifiedAt > @KnownModified
+  BEGIN
+    INSERT INTO dbo.BoxUploadLogs(FileName, FullPath, BoxFolderId, LocalModifiedAt, Status)
+    VALUES (REVERSE(SUBSTRING(REVERSE(@FullPath),1,CHARINDEX('\',REVERSE(@FullPath))-1)),
+            @FullPath, @BoxFolderId, @LocalModifiedAt, 'Pending');
+  END
+END
+GO
+
+-- Load pending
+CREATE OR ALTER PROC dbo.sp_Log_LoadPending
+  @BoxFolderId VARCHAR(100) = NULL
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SELECT Id, FileName, FullPath, BoxFolderId, LocalModifiedAt, BoxFileId
+  FROM dbo.BoxUploadLogs
+  WHERE Status='Pending'
+    AND (@BoxFolderId IS NULL OR BoxFolderId=@BoxFolderId)
+  ORDER BY Id;
+END
+GO
+
+-- Update status log + simpan BoxFileId (kalau ketahuan) + LocalModifiedAt
+CREATE OR ALTER PROC dbo.sp_Log_UpdateStatus
+  @Id INT,
+  @Status VARCHAR(50),
+  @ResponseMessage VARCHAR(MAX) = NULL,
+  @BoxFileId VARCHAR(100) = NULL,
+  @LocalModifiedAt DATETIME = NULL
+AS
+BEGIN
+  SET NOCOUNT ON;
+  UPDATE dbo.BoxUploadLogs
+    SET Status=@Status,
+        ResponseMessage=@ResponseMessage,
+        BoxFileId = COALESCE(@BoxFileId, BoxFileId),
+        LocalModifiedAt = COALESCE(@LocalModifiedAt, LocalModifiedAt),
+        CreatedAt = GETDATE()
+  WHERE Id=@Id;
+END
+GO
