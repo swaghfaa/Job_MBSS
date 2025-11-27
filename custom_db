@@ -1,0 +1,162 @@
+-- DB: JobBoxDB
+-- =========================================
+-- TABLES
+-- =========================================
+IF OBJECT_ID('dbo.BoxPaths') IS NULL
+BEGIN
+  CREATE TABLE dbo.BoxPaths (
+      Id INT IDENTITY(1,1) PRIMARY KEY,
+      SourcePath        VARCHAR(500) NOT NULL,
+      TargetFolderId    VARCHAR(100) NOT NULL, -- Box folder id (e.g. "0")
+      IsActive          BIT NOT NULL DEFAULT 1
+  );
+END
+GO
+
+IF OBJECT_ID('dbo.BoxUploadLogs') IS NULL
+BEGIN
+  CREATE TABLE dbo.BoxUploadLogs (
+      Id INT IDENTITY(1,1) PRIMARY KEY,
+      FileName         VARCHAR(300),
+      FullPath         VARCHAR(500),
+      BoxFolderId      VARCHAR(100),
+      Status           VARCHAR(50),            -- Pending | Success | Failed | Exists
+      ResponseMessage  VARCHAR(MAX),
+      CreatedAt        DATETIME DEFAULT GETDATE()
+  );
+
+  -- Optional: cegah duplikasi Pending/Sukses pada file yang sama
+  CREATE UNIQUE INDEX IX_BoxUploadLogs_UniquePending
+  ON dbo.BoxUploadLogs(FullPath, BoxFolderId, Status)
+  WHERE Status IN ('Pending','Success','Exists');
+END
+GO
+
+IF OBJECT_ID('dbo.BoxTokens') IS NULL
+BEGIN
+  CREATE TABLE dbo.BoxTokens (
+      Id INT IDENTITY(1,1) PRIMARY KEY,
+      AccessTokenEnc   VARCHAR(MAX) NULL,   -- encrypted (base64)
+      RefreshTokenEnc  VARCHAR(MAX) NULL,   -- encrypted (base64)
+      UpdatedAt        DATETIME DEFAULT GETDATE()
+  );
+
+  INSERT INTO dbo.BoxTokens(AccessTokenEnc, RefreshTokenEnc)
+  VALUES (NULL, NULL);
+END
+GO
+
+-- =========================================
+-- STORED PROCEDURES
+-- =========================================
+
+-- Ambil paths aktif
+IF OBJECT_ID('dbo.sp_Paths_GetActive') IS NOT NULL DROP PROC dbo.sp_Paths_GetActive;
+GO
+CREATE PROC dbo.sp_Paths_GetActive
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SELECT Id, SourcePath, TargetFolderId
+  FROM dbo.BoxPaths
+  WHERE IsActive = 1;
+END
+GO
+
+-- Insert 'Pending' kalau belum ada (hindari duplikasi)
+IF OBJECT_ID('dbo.sp_Log_InsertPendingIfNeeded') IS NOT NULL DROP PROC dbo.sp_Log_InsertPendingIfNeeded;
+GO
+CREATE PROC dbo.sp_Log_InsertPendingIfNeeded
+  @FullPath      VARCHAR(500),
+  @BoxFolderId   VARCHAR(100)
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM dbo.BoxUploadLogs
+    WHERE FullPath = @FullPath
+      AND BoxFolderId = @BoxFolderId
+      AND Status IN ('Pending','Success','Exists')
+  )
+  BEGIN
+    INSERT INTO dbo.BoxUploadLogs(FileName, FullPath, BoxFolderId, Status)
+    VALUES (REVERSE(SUBSTRING(REVERSE(@FullPath), 1, CHARINDEX('\', REVERSE(@FullPath)) - 1)),
+            @FullPath, @BoxFolderId, 'Pending');
+  END
+END
+GO
+
+-- Ambil semua Pending (bisa difilter per folder)
+IF OBJECT_ID('dbo.sp_Log_LoadPending') IS NOT NULL DROP PROC dbo.sp_Log_LoadPending;
+GO
+CREATE PROC dbo.sp_Log_LoadPending
+  @BoxFolderId VARCHAR(100) = NULL
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SELECT Id, FileName, FullPath, BoxFolderId
+  FROM dbo.BoxUploadLogs
+  WHERE Status = 'Pending'
+    AND (@BoxFolderId IS NULL OR BoxFolderId = @BoxFolderId)
+  ORDER BY Id;
+END
+GO
+
+-- Update status upload
+IF OBJECT_ID('dbo.sp_Log_UpdateStatus') IS NOT NULL DROP PROC dbo.sp_Log_UpdateStatus;
+GO
+CREATE PROC dbo.sp_Log_UpdateStatus
+  @Id INT,
+  @Status VARCHAR(50),
+  @ResponseMessage VARCHAR(MAX)
+AS
+BEGIN
+  SET NOCOUNT ON;
+  UPDATE dbo.BoxUploadLogs
+  SET Status = @Status,
+      ResponseMessage = @ResponseMessage,
+      CreatedAt = GETDATE()
+  WHERE Id = @Id;
+END
+GO
+
+-- Ambil token terenkripsi (top 1)
+IF OBJECT_ID('dbo.sp_Tokens_Get') IS NOT NULL DROP PROC dbo.sp_Tokens_Get;
+GO
+CREATE PROC dbo.sp_Tokens_Get
+AS
+BEGIN
+  SET NOCOUNT ON;
+  SELECT TOP 1 AccessTokenEnc, RefreshTokenEnc
+  FROM dbo.BoxTokens
+  ORDER BY Id ASC;
+END
+GO
+
+-- Simpan (upsert) token terenkripsi
+IF OBJECT_ID('dbo.sp_Tokens_Save') IS NOT NULL DROP PROC dbo.sp_Tokens_Save;
+GO
+CREATE PROC dbo.sp_Tokens_Save
+  @AccessTokenEnc  VARCHAR(MAX),
+  @RefreshTokenEnc VARCHAR(MAX)
+AS
+BEGIN
+  SET NOCOUNT ON;
+
+  IF EXISTS (SELECT 1 FROM dbo.BoxTokens)
+  BEGIN
+    UPDATE dbo.BoxTokens
+    SET AccessTokenEnc = @AccessTokenEnc,
+        RefreshTokenEnc = @RefreshTokenEnc,
+        UpdatedAt = GETDATE()
+    WHERE Id = (SELECT TOP 1 Id FROM dbo.BoxTokens ORDER BY Id ASC);
+  END
+  ELSE
+  BEGIN
+    INSERT INTO dbo.BoxTokens(AccessTokenEnc, RefreshTokenEnc)
+    VALUES (@AccessTokenEnc, @RefreshTokenEnc);
+  END
+END
+GO
